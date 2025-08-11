@@ -1,220 +1,225 @@
 #!/usr/bin/env bash
-# setup_hardening.sh
-# Debian/Ubuntu hardening: create user + SSH key login + disable passwords + set SSH port + UFW allow only SSH & Xray
-set -euo pipefail
+set -Eeuo pipefail
+
+# ===== Config / Args =====
+STATE_DIR="/var/lib/xrayfather"
+LOG_DIR="/var/log/xrayfather"
+STATE_FILE="$STATE_DIR/state.steps"
+LOG_FILE="$LOG_DIR/setup-$(date +%Y%m%d-%H%M%S).log"
+
+USER_NAME=""
+PUBKEY=""
+XRAY_PORTS=""
+SSH_PORT=""
+NO_UFW=0
+UNDO=0
 
 usage() {
-  cat <<'EOF'
-Usage:
-  sudo ./setup_hardening.sh -u <username> -k "<public_ssh_key>" [-x <port>[,<port>...]]... [-p <ssh_port>]
-
-Options:
-  -u   Username to allow SSH login (will be created if absent)
-  -k   OpenSSH public key line (e.g. 'ssh-ed25519 AAAA... user@bot')
-  -x   Xray port(s). May be passed multiple times or as comma/space-separated list, e.g.:
-       -x 443 -x 8443    OR    -x "443,8443 10000"
-  -p   SSH port to set (if omitted, a random free port will be chosen, avoiding Xray ports)
-
-Examples:
-  sudo ./setup_hardening.sh -u deploy -k "ssh-ed25519 AAAA... user@bot" -x 443
-  sudo ./setup_hardening.sh -u deploy -k "ssh-rsa AAAA... user@bot" -x "443,8443" -p 55222
+  cat <<EOF
+Usage: $0 -u <user> -k <pubkey> -x <ports_csv> -p <ssh_port> [--no-ufw] [--undo]
+  -u    системный пользователь для SSH
+  -k    публичный ключ (OpenSSH)
+  -x    порты Xray через запятую (напр. 443,8443)
+  -p    новый SSH порт
+  --no-ufw  не трогать UFW
+  --undo    выполнить полный откат согласно state-файлу
 EOF
 }
 
-# ---------- parse args ----------
-NEW_USER=""
-PUBKEY=""
-declare -a XRAY_PORTS=()
-SSH_PORT=""
+# простейший логгер
+log() { echo "[$(date +'%F %T')] $*" | tee -a "$LOG_FILE" >&2; }
 
-while getopts ":u:k:x:p:h" opt; do
-  case "$opt" in
-    u) NEW_USER="$OPTARG" ;;
-    k) PUBKEY="$OPTARG" ;;
-    x) XRAY_PORTS+=("$OPTARG") ;;
-    p) SSH_PORT="$OPTARG" ;;
-    h) usage; exit 0 ;;
-    \?) echo "Unknown option: -$OPTARG" >&2; usage; exit 1 ;;
-    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
-  esac
-done
-
-if [[ -z "$NEW_USER" || -z "$PUBKEY" ]]; then
-  echo "❌ Параметры -u и -k обязательны." >&2
-  usage
-  exit 1
-fi
-
-# ---------- helpers ----------
-is_valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
-
-port_in_use() {
-  local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -ltnu | awk '{print $5}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$port" || return 1
-  else
-    netstat -ltnu 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -qx "$port" || return 1
-  fi
-}
-
-contains() {
-  local needle="$1"; shift
-  for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done
-  return 1
-}
-
-random_ssh_port() {
-  local port
-  while :; do
-    port=$(shuf -i 1025-65000 -n 1)
-    contains "$port" "${XRAY_PORTS_FLAT[@]}" && continue
-    port_in_use "$port" && continue
-    echo "$port"; return 0
-  done
-}
-
-set_sshd_option() {
-  local key="$1" value="$2" file="/etc/ssh/sshd_config"
-  if grep -qE "^[#[:space:]]*${key}\b" "$file"; then
-    sed -i "s~^[#[:space:]]*${key}\b.*~${key} ${value}~g" "$file"
-  else
-    echo "${key} ${value}" >> "$file"
-  fi
-}
-
-# ---------- flatten XRAY_PORTS ----------
-if ((${#XRAY_PORTS[@]} > 0)); then
-  tmp=()
-  for item in "${XRAY_PORTS[@]}"; do
-    # поддерживаем "443,8443 10000"
-    IFS=', ' read -r -a parts <<< "$item"
-    for p in "${parts[@]}"; do
-      [[ -n "$p" ]] && tmp+=("$p")
-    done
-  done
-  XRAY_PORTS=("${tmp[@]}")
-fi
-# Уникализируем и валидируем
-declare -A seen=()
-XRAY_PORTS_FLAT=()
-for p in "${XRAY_PORTS[@]:-}"; do
-  [[ -z "$p" ]] && continue
-  if ! is_valid_port "$p"; then
-    echo "❌ Некорректный Xray порт: $p" >&2; exit 1
-  fi
-  if [[ -z "${seen[$p]:-}" ]]; then
-    XRAY_PORTS_FLAT+=("$p")
-    seen[$p]=1
-  fi
-done
-
-if [[ -n "$SSH_PORT" ]] && ! is_valid_port "$SSH_PORT"; then
-  echo "❌ Некорректный SSH порт: $SSH_PORT" >&2; exit 1
-fi
-
-# ---------- OS check & packages ----------
-if ! command -v apt-get >/dev/null 2>&1; then
-  echo "❌ Скрипт рассчитан на Debian/Ubuntu (apt)." >&2
-  exit 1
-fi
-
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends sudo ufw openssh-server net-tools iproute2
-
-# ---------- user & ssh key ----------
-if ! id -u "$NEW_USER" >/dev/null 2>&1; then
-  adduser --disabled-password --gecos "" "$NEW_USER"
-fi
-usermod -aG sudo "$NEW_USER"
-
-USER_HOME="$(getent passwd "$NEW_USER" | cut -d: -f6)"
-mkdir -p "$USER_HOME/.ssh"
-chmod 700 "$USER_HOME/.ssh"
-AUTH_KEYS="$USER_HOME/.ssh/authorized_keys"
-touch "$AUTH_KEYS"
-# добавляем ключ, если строки нет
-grep -qxF "$PUBKEY" "$AUTH_KEYS" || echo "$PUBKEY" >> "$AUTH_KEYS"
-chmod 600 "$AUTH_KEYS"
-chown -R "$NEW_USER:$NEW_USER" "$USER_HOME/.ssh"
-
-# ---------- sshd config ----------
-SSHD_CFG="/etc/ssh/sshd_config"
-if [[ ! -f /etc/ssh/sshd_config.backup_hardening ]]; then
-  cp "$SSHD_CFG" /etc/ssh/sshd_config.backup_hardening
-fi
-
-set_sshd_option "PasswordAuthentication" "no"
-set_sshd_option "ChallengeResponseAuthentication" "no"
-set_sshd_option "PermitRootLogin" "no"
-set_sshd_option "PubkeyAuthentication" "yes"
-set_sshd_option "PermitEmptyPasswords" "no"
-# при желании можно ограничить вход только новым пользователем:
-# set_sshd_option "AllowUsers" "$NEW_USER"
-
-# ---------- SSH port ----------
-if [[ -z "${SSH_PORT:-}" ]]; then
-  SSH_PORT="$(random_ssh_port)"
-else
-  if contains "$SSH_PORT" "${XRAY_PORTS_FLAT[@]:-}"; then
-    echo "❌ SSH порт ($SSH_PORT) не может совпадать с Xray портом." >&2
+ensure_root() {
+  if [[ $EUID -ne 0 ]]; then
+    log "Нужны права root."
     exit 1
   fi
-  if port_in_use "$SSH_PORT"; then
-    echo "❌ SSH порт $SSH_PORT уже занят." >&2
-    exit 1
+}
+
+parse_args() {
+  while (( "$#" )); do
+    case "$1" in
+      -u) USER_NAME="$2"; shift 2 ;;
+      -k) PUBKEY="$2"; shift 2 ;;
+      -x) XRAY_PORTS="$2"; shift 2 ;;
+      -p) SSH_PORT="$2"; shift 2 ;;
+      --no-ufw) NO_UFW=1; shift ;;
+      --undo) UNDO=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) log "Неизвестный аргумент: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  if [[ $UNDO -eq 0 ]]; then
+    [[ -n "$USER_NAME" && -n "$PUBKEY" && -n "$XRAY_PORTS" && -n "$SSH_PORT" ]] || {
+      usage; exit 1;
+    }
   fi
-fi
-set_sshd_option "Port" "$SSH_PORT"
+}
 
-# ---------- validate sshd config ----------
-if ! sshd -t 2>/tmp/sshd_check.err; then
-  echo "❌ Ошибка проверки sshd_config:" >&2
-  cat /tmp/sshd_check.err >&2
-  echo "↩️ Восстанавливаю бэкап sshd_config..."
-  cp /etc/ssh/sshd_config.backup_hardening "$SSHD_CFG"
-  exit 1
-fi
+# ===== State helpers =====
+state_init() {
+  mkdir -p "$STATE_DIR" "$LOG_DIR"
+  touch "$STATE_FILE"
+}
+state_add() { echo "$1" >> "$STATE_FILE"; }
+state_read_reverse() { tac "$STATE_FILE" 2>/dev/null || tail -r "$STATE_FILE"; }
+state_clear() { : > "$STATE_FILE"; }
 
-# ---------- UFW rules ----------
-# ⚠️ Жёсткий вариант: сбросить все правила и открыть только нужное
-ufw --force reset >/dev/null 2>&1 || true
-ufw default deny incoming
-ufw default allow outgoing
+# ===== Rollback =====
+rollback() {
+  log "⚠️ Ошибка. Запуск автоматического отката..."
+  if [[ ! -s "$STATE_FILE" ]]; then
+    log "Нет шагов для отката."
+    return
+  fi
+  while read -r STEP; do
+    case "$STEP" in
+      user_created:*)       _=${STEP#user_created:}; userdel -r -f "$_" 2>/dev/null || true; log "UNDO user $_";;
+      ssh_key_installed:*)  USER=${STEP#ssh_key_installed:}; rm -f "/home/$USER/.ssh/authorized_keys" 2>/dev/null || true; log "UNDO authkey $USER";;
+      ufw_installed)        apt-get remove -y ufw >/dev/null 2>&1 || true; log "UNDO ufw install";;
+      ufw_rules_applied:*)  IFS=',' read -r -a ports <<< "${STEP#ufw_rules_applied:}"
+                            for p in "${ports[@]}"; do ufw delete allow "$p" 2>/dev/null || true; done
+                            ufw delete allow "OpenSSH" 2>/dev/null || true
+                            log "UNDO ufw rules";;
+      ssh_port_changed:*)   OLD=${STEP#ssh_port_changed:}; sed -i "s/^#\?Port .*/Port ${OLD}/" /etc/ssh/sshd_config || true
+                            systemctl reload ssh || systemctl reload sshd || true
+                            log "UNDO ssh port -> $OLD";;
+      ssh_pwd_disabled)     sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+                            systemctl reload ssh || systemctl reload sshd || true
+                            log "UNDO disable password";;
+      root_ssh_disabled)    sed -i 's/^PermitRootLogin no/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
+                            systemctl reload ssh || systemctl reload sshd || true
+                            log "UNDO root ssh disable";;
+      *)
+        log "Неизвестный шаг для UNDO: $STEP"
+      ;;
+    esac
+  done < <(state_read_reverse)
+  state_clear
+  log "✅ Откат завершён."
+}
 
-# SSH (только TCP)
-ufw allow "${SSH_PORT}"/tcp
+trap 'rc=$?; [[ $UNDO -eq 0 ]] && rollback; exit $rc' ERR
 
-# Xray: TCP+UDP для каждого указанного порта
-for p in "${XRAY_PORTS_FLAT[@]:-}"; do
-  ufw allow "${p}"/tcp
-  ufw allow "${p}"/udp
-done
+# ===== Steps (do + record) =====
+step_create_user() {
+  if id "$USER_NAME" &>/dev/null; then
+    log "Пользователь $USER_NAME уже существует — пропускаю."
+  else
+    adduser --disabled-password --gecos "" "$USER_NAME"
+    usermod -aG sudo "$USER_NAME"
+    state_add "user_created:$USER_NAME"
+    log "Создан пользователь $USER_NAME"
+  fi
+}
 
-ufw --force enable
+step_install_key() {
+  install -d -m 700 -o "$USER_NAME" -g "$USER_NAME" "/home/$USER_NAME/.ssh"
+  printf '%s\n' "$PUBKEY" > "/home/$USER_NAME/.ssh/authorized_keys"
+  chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.ssh/authorized_keys"
+  chmod 600 "/home/$USER_NAME/.ssh/authorized_keys"
+  state_add "ssh_key_installed:$USER_NAME"
+  log "Добавлен публичный ключ для $USER_NAME"
+}
 
-# ---------- ensure /run/sshd exists ----------
-if [ ! -d /run/sshd ]; then
-  mkdir -p /run/sshd
-  chmod 0755 /run/sshd
-  chown root:root /run/sshd
-fi
+step_setup_ufw() {
+  [[ $NO_UFW -eq 1 ]] && { log "UFW пропущен по флагу"; return; }
+  if ! command -v ufw >/dev/null 2>&1; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+    state_add "ufw_installed"
+    log "Установлен UFW"
+  fi
 
-# ---------- restart ssh ----------
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl restart ssh || systemctl restart sshd || true
-else
-  service ssh restart || service sshd restart || true
-fi
+  ufw allow OpenSSH || true
+  IFS=',' read -r -a ports <<< "$XRAY_PORTS"
+  for p in "${ports[@]}"; do ufw allow "$p"; done
+  ufw --force enable
+  state_add "ufw_rules_applied:$XRAY_PORTS"
+  log "UFW: разрешены OpenSSH и порты ${XRAY_PORTS}"
+}
 
-echo
-echo "✅ Готово!"
-echo "Пользователь:   $NEW_USER"
-echo "SSH порт:       $SSH_PORT"
-if ((${#XRAY_PORTS_FLAT[@]:-0} > 0)); then
-  echo "Xray порты:     ${XRAY_PORTS_FLAT[*]} (TCP+UDP разрешены)"
-else
-  echo "Xray порты:     не заданы"
-fi
-echo
-echo "Подключение:    ssh -p $SSH_PORT $NEW_USER@<server_ip>"
+# Двухфазная смена порта: валидируем конфиг и доступность
+step_change_ssh_port() {
+  local old_port new_port conf="/etc/ssh/sshd_config"
+  old_port=$(ss -tlnp | awk '/sshd/ {print $4}' | sed -n 's/.*:\([0-9]\+\)$/\1/p' | head -n1)
+  new_port="$SSH_PORT"
+
+  # правим конфиг безопасно
+  if grep -qE '^#?Port ' "$conf"; then
+    sed -i "s/^#\?Port .*/Port ${new_port}/" "$conf"
+  else
+    echo "Port ${new_port}" >> "$conf"
+  fi
+
+  # проверка синтаксиса (если доступна)
+  if command -v sshd >/dev/null 2>&1; then
+    sshd -t
+  fi
+
+  # мягкая перезагрузка
+  systemctl reload ssh || systemctl reload sshd
+
+  # проверяем, что локально порт слушается
+  sleep 0.5
+  ss -tln | grep -q ":${new_port} " || { log "Новый порт ${new_port} не слушает"; return 1; }
+
+  # записываем шаг только когда убедились
+  state_add "ssh_port_changed:${old_port}"
+  log "SSH порт изменён: ${old_port} -> ${new_port}"
+}
+
+step_harden_ssh() {
+  local conf="/etc/ssh/sshd_config"
+  # запрещаем парольный вход, только ключ
+  if grep -q '^PasswordAuthentication ' "$conf"; then
+    sed -i 's/^PasswordAuthentication .*/PasswordAuthentication no/' "$conf"
+  else
+    echo "PasswordAuthentication no" >> "$conf"
+  fi
+  systemctl reload ssh || systemctl reload sshd
+  state_add "ssh_pwd_disabled"
+  log "Отключена аутентификация по паролю"
+
+  # запрещаем root по SSH (оставляем prohibit-password — опционально замени на no)
+  if grep -q '^PermitRootLogin ' "$conf"; then
+    sed -i 's/^PermitRootLogin .*/PermitRootLogin no/' "$conf"
+  else
+    echo "PermitRootLogin no" >> "$conf"
+  fi
+  systemctl reload ssh || systemctl reload sshd
+  state_add "root_ssh_disabled"
+  log "Отключён SSH-доступ для root"
+}
+
+# заглушка под установку/настройку Xray — расширишь своей логикой
+step_prepare_xray_ports() {
+  # Здесь можно пробросить порты в iptables/nftables, если не UFW
+  log "XRAY порты подготовлены: ${XRAY_PORTS}"
+}
+
+# ===== Main =====
+main() {
+  ensure_root
+  parse_args "$@"
+  state_init
+  log "Старт. Лог: $LOG_FILE"
+
+  if [[ $UNDO -eq 1 ]]; then
+    rollback
+    exit 0
+  fi
+
+  # порядок шагов имеет значение
+  step_create_user
+  step_install_key
+  step_setup_ufw
+  step_prepare_xray_ports
+  step_change_ssh_port
+  step_harden_ssh
+
+  log "✅ Готово. Шаги записаны в $STATE_FILE"
+}
+
+main "$@"
