@@ -1,281 +1,349 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ===== Config / Args =====
+# ==============================
+# Helpers & globals
+# ==============================
+LOG_TAG="[xrayfather]"
 STATE_DIR="/var/lib/xrayfather"
-LOG_DIR="/var/log/xrayfather"
-STATE_FILE="$STATE_DIR/state.steps"
-LOG_FILE="$LOG_DIR/setup-$(date +%Y%m%d-%H%M%S).log"
+STATE_FILE="$STATE_DIR/state"
+SSHD_DIR="/etc/ssh/sshd_config.d"
+DROPIN="$SSHD_DIR/xrayfather.conf"
 
+log(){ echo -e "${LOG_TAG} $*"; }
+die(){ echo -e "${LOG_TAG} ERROR: $*" >&2; exit 1; }
+
+state_add(){ mkdir -p "$STATE_DIR"; echo "$1" >> "$STATE_FILE"; }
+state_has(){ [[ -f "$STATE_FILE" ]] && grep -q "^$1$" "$STATE_FILE"; }
+state_clear(){ : > "$STATE_FILE"; }
+state_get(){ [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || true; }
+
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
+
+require_root(){
+  [[ "$(id -u)" -eq 0 ]] || die "Run as root (sudo)."
+}
+
+ensure_sshd_dropin_dir(){
+  mkdir -p "$SSHD_DIR"; chmod 755 "$SSHD_DIR"
+}
+
+# ==============================
+# Args
+# ==============================
 USER_NAME=""
-PUBKEY=""
+PUB_KEY=""
 XRAY_PORTS=""
 SSH_PORT=""
-NO_UFW=0
-UNDO=0
+NO_UFW=false
+UNDO=false
+TWO_PHASE=false
+FINALIZE=false
 
-usage() {
-  cat <<'EOF'
-Usage: setup_hardening.sh -u <user> -k <pubkey> -x <xray_ports_csv> -p <ssh_port> [--no-ufw] [--undo]
-  -u   системный пользователь для SSH
-  -k   публичный ключ (OpenSSH)
-  -x   порты Xray через запятую (напр. 443,8443)
-  -p   новый SSH порт
-  --no-ufw  не трогать UFW
-  --undo    выполнить полный откат согласно state-файлу
+usage(){
+cat <<EOF
+Usage:
+  $0 -u <user> -k <pubkey> -x <ports_csv> -p <ssh_port> [--no-ufw] [--two-phase]
+  $0 --finalize -p <ssh_port>
+  $0 --undo
+
+Flags:
+  -u, --user           Имя нового пользователя (будет создан при необходимости)
+  -k, --pubkey         Публичный ключ OpenSSH (строка "ssh-ed25519 ..." или "ssh-rsa ...")
+  -x, --xray-ports     Список портов Xray через запятую, напр. "443,8443"
+  -p, --ssh-port       Новый порт SSH (например 22422)
+      --no-ufw         Не трогать UFW
+      --two-phase      Фаза 1: оставить 22 и новый порт одновременно, чтобы проверить доступ
+      --finalize       Фаза 2: удалить 22 и правило OpenSSH, оставить только новый порт
+      --undo           Откат изменений, записанных в стейте
+
+Примеры:
+  Однопроходный (сразу на новый порт):
+    sudo bash $0 -u tg_123 -k "ssh-ed25519 AAAA... user@bot" -x "443" -p 22422
+
+  Двухфазный:
+    sudo bash $0 -u tg_123 -k "ssh-ed25519 AAAA... user@bot" -x "443" -p 22422 --two-phase
+    # проверить вход по новому порту, затем
+    sudo bash $0 --finalize -p 22422
+
+  Откат:
+    sudo bash $0 --undo
 EOF
 }
 
-# простейший логгер
-log() {
-  echo "[$(date +'%F %T')] $*" | tee -a "$LOG_FILE" >&2
+# parse
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|--user)       USER_NAME="$2"; shift 2 ;;
+    -k|--pubkey)     PUB_KEY="$2"; shift 2 ;;
+    -x|--xray-ports) XRAY_PORTS="$2"; shift 2 ;;
+    -p|--ssh-port)   SSH_PORT="$2"; shift 2 ;;
+    --no-ufw)        NO_UFW=true; shift ;;
+    --undo)          UNDO=true; shift ;;
+    --two-phase)     TWO_PHASE=true; shift ;;
+    --finalize)      FINALIZE=true; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               echo "Unknown arg: $1"; usage; exit 1 ;;
+  esac
+done
+
+require_root
+
+# ==============================
+# Rollback
+# ==============================
+rollback(){
+  log "ROLLBACK: started"
+  # UFW: вернуть OpenSSH если удаляли
+  if state_has "ufw_openssh_deleted"; then
+    if have_cmd ufw; then
+      ufw allow OpenSSH || true
+      log "ROLLBACK: UFW OpenSSH rule restored"
+    fi
+  fi
+
+  # UFW: удалить добавленные правила (SSH_PORT/XRAY) если записаны
+  if state_has "ufw_rules_applied"; then
+    if have_cmd ufw; then
+      # читаем список из стейта
+      # формат хранения: ufw_rules_applied:ssh:<port>,xray:<csv>
+      while IFS= read -r line; do
+        [[ "$line" == ufw_rules_applied:* ]] || continue
+        rules="${line#ufw_rules_applied:}"
+        IFS=',' read -r -a items <<< "$rules"
+        for item in "${items[@]}"; do
+          case "$item" in
+            ssh:*)   p="${item#ssh:}"; [[ -n "$p" ]] && ufw delete allow "$p"/tcp || true ;;
+            xray:*)  csv="${item#xray:}"; IFS=';' read -r -a xp <<< "$csv"
+                     for q in "${xp[@]}"; do [[ -n "$q" ]] && ufw delete allow "$q"/tcp || true; done ;;
+          esac
+        done
+      done < "$STATE_FILE"
+      log "ROLLBACK: UFW custom rules removed"
+    fi
+  fi
+
+  # SSHD drop-in
+  if state_has "sshd_dropin_written"; then
+    rm -f "$DROPIN" || true
+    if have_cmd systemctl; then systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    else service ssh restart 2>/dev/null || true
+    fi
+    log "ROLLBACK: drop-in removed, ssh restarted"
+  fi
+
+  # authorized_keys cleanup if we created user
+  if state_has "user_created:${USER_NAME:-}"; then
+    # Осторожно: не удаляем пользователя автоматически; только чистим ключ, если нужно.
+    : # no-op, оставим пользователя
+  fi
+
+  log "ROLLBACK: done"
 }
 
-ensure_root() {
-  if [[ $EUID -ne 0 ]]; then
-    log "Нужны права root."
-    exit 1
+# ==============================
+# Steps
+# ==============================
+step_update_packages(){
+  # необязательный шаг: обновление индексов, если apt есть
+  if have_cmd apt-get; then
+    apt-get update -y || true
   fi
 }
 
-parse_args() {
-  while (("$#")); do
-    case "$1" in
-      -u) USER_NAME="$2"; shift 2 ;;
-      -k) PUBKEY="$2"; shift 2 ;;
-      -x) XRAY_PORTS="$2"; shift 2 ;;
-      -p) SSH_PORT="$2"; shift 2 ;;
-      --no-ufw) NO_UFW=1; shift ;;
-      --undo) UNDO=1; shift ;;
-      -h|--help) usage; exit 0 ;;
-      *) log "Неизвестный аргумент: $1"; usage; exit 1 ;;
-    esac
-  done
-  if [[ $UNDO -eq 0 ]]; then
-    [[ -n "$USER_NAME" && -n "$PUBKEY" && -n "$XRAY_PORTS" && -n "$SSH_PORT" ]] || { usage; exit 1; }
-  fi
-}
+step_create_user_and_key(){
+  [[ -z "$USER_NAME" || -z "$PUB_KEY" ]] && return 0
 
-# ===== State helpers =====
-state_init() {
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
-  touch "$STATE_FILE"
-}
-state_add() { echo "$1" >> "$STATE_FILE"; }
-state_read_reverse() { tac "$STATE_FILE" 2>/dev/null || tail -r "$STATE_FILE"; }
-state_clear() { : > "$STATE_FILE"; }
-
-# ===== Rollback =====
-rollback() {
-  log "⚠️ Ошибка. Запуск автоматического отката..."
-  if [[ ! -s "$STATE_FILE" ]]; then
-    log "Нет шагов для отката."
-    return
-  fi
-  while read -r STEP; do
-    case "$STEP" in
-      user_created:*)
-        _=${STEP#user_created:}
-        userdel -r -f "$_" 2>/dev/null || true
-        log "UNDO user $_"
-        ;;
-      ssh_key_installed:*)
-        USER=${STEP#ssh_key_installed:}
-        rm -f "/home/$USER/.ssh/authorized_keys" 2>/dev/null || true
-        log "UNDO authkey $USER"
-        ;;
-      ufw_installed)
-        apt-get remove -y ufw >/dev/null 2>&1 || true
-        log "UNDO ufw install"
-        ;;
-      ufw_rules_applied:*)
-        IFS=',' read -r -a ports <<< "${STEP#ufw_rules_applied:}"
-        for p in "${ports[@]}"; do ufw delete allow "$p" 2>/dev/null || true; done
-        ufw delete allow "OpenSSH" 2>/dev/null || true
-        log "UNDO ufw rules"
-        ;;
-      ssh_socket_disabled)
-        # вернём сокет-активацию, если отключали
-        systemctl disable --now ssh.service 2>/dev/null || true
-        systemctl enable --now ssh.socket 2>/dev/null || true
-        log "UNDO ssh.socket disable / service enable"
-        ;;
-      ssh_port_dropin:*)
-        # уберём наш drop-in и перезапустим ssh
-        rm -f /etc/ssh/sshd_config.d/port.conf 2>/dev/null || true
-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-        log "UNDO ssh drop-in port.conf"
-        ;;
-      ssh_port_changed:*)
-        OLD=${STEP#ssh_port_changed:}
-        # на случай, если drop-in уже удалён, вернём строкой в основной конфиг
-        if grep -qE '^#?Port ' /etc/ssh/sshd_config; then
-          sed -i "s/^#\?Port .*/Port ${OLD}/" /etc/ssh/sshd_config || true
-        else
-          echo "Port ${OLD}" >> /etc/ssh/sshd_config
-        fi
-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-        log "UNDO ssh port -> $OLD"
-        ;;
-      ssh_pwd_disabled)
-        sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
-        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-        log "UNDO disable password"
-        ;;
-      root_ssh_disabled)
-        sed -i 's/^PermitRootLogin no/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
-        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-        log "UNDO root ssh disable"
-        ;;
-      *)
-        log "Неизвестный шаг для UNDO: $STEP"
-        ;;
-    esac
-  done < <(state_read_reverse)
-  state_clear
-  log "✅ Откат завершён."
-}
-trap 'rc=$?; [[ $UNDO -eq 0 ]] && rollback; exit $rc' ERR
-
-# ===== Steps (do + record) =====
-step_create_user() {
   if id "$USER_NAME" &>/dev/null; then
-    log "Пользователь $USER_NAME уже существует — пропускаю."
+    log "User $USER_NAME exists"
   else
-    adduser --disabled-password --gecos "" "$USER_NAME"
-    usermod -aG sudo "$USER_NAME"
-    state_add "user_created:$USER_NAME"
-    log "Создан пользователь $USER_NAME"
+    if have_cmd adduser; then
+      adduser --disabled-password --gecos "" "$USER_NAME"
+    else
+      useradd -m -s /bin/bash "$USER_NAME"
+    fi
+    usermod -aG sudo "$USER_NAME" || true
+    state_add "user_created:${USER_NAME}"
+    log "User $USER_NAME created and added to sudo"
   fi
+
+  local ssh_dir="/home/$USER_NAME/.ssh"
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  echo "$PUB_KEY" > "$ssh_dir/authorized_keys"
+  chmod 600 "$ssh_dir/authorized_keys"
+  chown -R "$USER_NAME:$USER_NAME" "$ssh_dir"
+  state_add "authorized_keys_set:${USER_NAME}"
+  log "authorized_keys set for $USER_NAME"
 }
 
-step_install_key() {
-  install -d -m 700 -o "$USER_NAME" -g "$USER_NAME" "/home/$USER_NAME/.ssh"
-  printf '%s\n' "$PUBKEY" > "/home/$USER_NAME/.ssh/authorized_keys"
-  chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.ssh/authorized_keys"
-  chmod 600 "/home/$USER_NAME/.ssh/authorized_keys"
-  state_add "ssh_key_installed:$USER_NAME"
-  log "Добавлен публичный ключ для $USER_NAME"
-}
+step_setup_ufw(){
+  $NO_UFW && { log "UFW disabled by flag"; return; }
 
-step_setup_ufw() {
-  [[ $NO_UFW -eq 1 ]] && { log "UFW пропущен по флагу"; return; }
-  if ! command -v ufw >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y ufw
-    state_add "ufw_installed"
-    log "Установлен UFW"
+  if ! have_cmd ufw; then
+    if have_cmd apt-get; then
+      apt-get install -y ufw
+    else
+      die "ufw not installed and no apt-get available"
+    fi
   fi
+
   ufw allow OpenSSH || true
-  IFS=',' read -r -a ports <<< "$XRAY_PORTS"
-  for p in "${ports[@]}"; do ufw allow "$p" || true; done
+
+  # Разрешаем новый SSH порт заранее
+  if [[ -n "$SSH_PORT" ]]; then
+    ufw allow "$SSH_PORT"/tcp || true
+  fi
+
+  # Разрешаем Xray порты
+  local ports_csv=""
+  if [[ -n "$XRAY_PORTS" ]]; then
+    IFS=',' read -r -a ports <<< "$XRAY_PORTS"
+    for p in "${ports[@]}"; do
+      [[ -n "$p" ]] || continue
+      ufw allow "$p"/tcp || true
+      ports_csv="${ports_csv:+$ports_csv;}$p"
+    done
+  fi
+
   ufw --force enable
-  state_add "ufw_rules_applied:$XRAY_PORTS"
-  log "UFW: разрешены OpenSSH и порты ${XRAY_PORTS}"
+  state_add "ufw_rules_applied:ssh:${SSH_PORT:-};xray:${ports_csv}"
+  log "UFW: allow OpenSSH, SSH=$SSH_PORT, XRAY=$XRAY_PORTS"
 }
 
-# Подготовка портов Xray — при необходимости расширь логикой iptables/nftables
-step_prepare_xray_ports() {
-  log "XRAY порты подготовлены: ${XRAY_PORTS}"
+write_sshd_dropin(){
+  ensure_sshd_dropin_dir
+  {
+    echo "# Managed by xrayfather"
+    if $TWO_PHASE && ! $FINALIZE; then
+      echo "Port 22"
+      [[ -n "$SSH_PORT" ]] && echo "Port $SSH_PORT"
+    else
+      [[ -n "$SSH_PORT" ]] && echo "Port $SSH_PORT"
+    fi
+    echo "PermitRootLogin no"
+    echo "PasswordAuthentication no"
+    echo "PubkeyAuthentication yes"
+    echo "KbdInteractiveAuthentication no"
+    echo "ChallengeResponseAuthentication no"
+    # Можно усилить:
+    # echo "AuthenticationMethods publickey"
+    # echo "UsePAM yes"
+  } > "$DROPIN"
+  chmod 644 "$DROPIN"
+  state_add "sshd_dropin_written"
+  log "sshd drop-in written to $DROPIN"
 }
 
-# Перевод SSH с socket-активации на сервис и смена порта через drop-in
-step_change_ssh_port() {
-  local new_port="$SSH_PORT"
-  local old_port
-  local dropin="/etc/ssh/sshd_config.d/port.conf"
-
-  # Определим текущий порт (если несколько — возьмём первый)
-  old_port=$(ss -tlnp | awk '/sshd/ {print $4}' | sed -n 's/.*:\([0-9]\+\)$/\1/p' | head -n1)
-  [[ -z "${old_port:-}" ]] && old_port=22
-
-  # Откроем новый порт в UFW заранее (22 не трогаем до проверки)
-  if [[ $NO_UFW -eq 0 ]]; then
-    ufw allow "${new_port}/tcp" || true
-  fi
-
-  # Отключить socket-активацию и включить обычный сервис
-  if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
-    systemctl disable --now ssh.socket
-    state_add "ssh_socket_disabled"
-  fi
-  systemctl enable --now ssh.service
-
-  # Создадим drop-in (чище, чем править основной конфиг)
-  mkdir -p /etc/ssh/sshd_config.d
-  cat > "$dropin" <<EOF
-Port ${new_port}
-# Для безопасной миграции можно временно держать и 22:
-# Port 22
-EOF
-  state_add "ssh_port_dropin:${new_port}"
-
-  # Проверка конфига и рестарт
-  if command -v sshd >/dev/null 2>&1; then
-    sshd -t
-  fi
-  systemctl restart ssh || systemctl restart sshd
-
-  # Проверим, что новый порт действительно слушает
-  sleep 0.7
-  if ! ss -tln | grep -qE "[: ]${new_port}(\s|$)"; then
-    log "Новый порт ${new_port} не слушает"
-    # для диагностики:
-    journalctl -u ssh --no-pager -n 100 >&2 || true
-    return 1
-  fi
-
-  state_add "ssh_port_changed:${old_port}"
-  log "SSH порт изменён: ${old_port} -> ${new_port}"
-}
-
-step_harden_ssh() {
-  local conf="/etc/ssh/sshd_config"
-
-  # отключаем парольный вход
-  if grep -q '^PasswordAuthentication ' "$conf"; then
-    sed -i 's/^PasswordAuthentication .*/PasswordAuthentication no/' "$conf"
+restart_sshd(){
+  if have_cmd systemctl; then
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || die "failed to restart ssh(d)"
   else
-    echo "PasswordAuthentication no" >> "$conf"
+    service ssh restart 2>/dev/null || die "failed to restart ssh service"
   fi
-  systemctl reload ssh || systemctl reload sshd
-  state_add "ssh_pwd_disabled"
-  log "Отключена аутентификация по паролю"
-
-  # запрещаем root по SSH
-  if grep -q '^PermitRootLogin ' "$conf"; then
-    sed -i 's/^PermitRootLogin .*/PermitRootLogin no/' "$conf"
-  else
-    echo "PermitRootLogin no" >> "$conf"
-  fi
-  systemctl reload ssh || systemctl reload sshd
-  state_add "root_ssh_disabled"
-  log "Отключён SSH-доступ для root"
+  log "sshd restarted"
 }
 
-# ===== Main =====
-main() {
-  ensure_root
-  parse_args "$@"
-  state_init
+verify_sshd_listens(){
+  [[ -n "$SSH_PORT" ]] || return 0
+  if have_cmd ss; then
+    ss -tln | grep -q ":$SSH_PORT " || die "sshd does not listen on $SSH_PORT"
+  elif have_cmd netstat; then
+    netstat -tln | grep -q ":$SSH_PORT " || die "sshd does not listen on $SSH_PORT"
+  else
+    log "No ss/netstat, skip listen check"
+  fi
+  log "sshd listens on $SSH_PORT (local check)"
+}
 
-  log "Старт. Лог: $LOG_FILE"
+step_configure_sshd(){
+  write_sshd_dropin
+  restart_sshd
+  verify_sshd_listens
+}
 
-  if [[ $UNDO -eq 1 ]]; then
-    rollback
+step_finalize_two_phase(){
+  # Выполняется если:
+  #  - обычный однопроходный (TWO_PHASE=false): надо удалить OpenSSH правило
+  #  - двухфазный finalize (FINALIZE=true): удалить 22 и правило OpenSSH
+  if $TWO_PHASE && ! $FINALIZE; then
+    log "Two-phase phase1 complete. Verify SSH on new port $SSH_PORT, then run with --finalize."
+    return 0
+  fi
+
+  # Переписываем drop-in без порта 22
+  ensure_sshd_dropin_dir
+  {
+    echo "# Managed by xrayfather (finalized)"
+    [[ -n "$SSH_PORT" ]] && echo "Port $SSH_PORT"
+    echo "PermitRootLogin no"
+    echo "PasswordAuthentication no"
+    echo "PubkeyAuthentication yes"
+    echo "KbdInteractiveAuthentication no"
+    echo "ChallengeResponseAuthentication no"
+  } > "$DROPIN"
+  chmod 644 "$DROPIN"
+  restart_sshd
+  verify_sshd_listens
+  state_add "sshd_finalized"
+  log "Finalized: Port 22 removed from sshd"
+
+  if ! $NO_UFW; then
+    # удалить профиль OpenSSH (обычно 22/tcp)
+    if ufw status | grep -q "OpenSSH"; then
+      ufw delete allow OpenSSH || true
+    else
+      ufw delete allow 22/tcp || true
+    fi
+    state_add "ufw_openssh_deleted"
+    log "UFW: OpenSSH rule removed"
+  fi
+}
+
+# ==============================
+# Main flows
+# ==============================
+do_undo(){
+  [[ -f "$STATE_FILE" ]] || { log "Nothing to undo (state empty)"; exit 0; }
+  rollback
+  rm -f "$STATE_FILE"
+  log "UNDO complete"
+}
+
+main_setup(){
+  # валидируем обязательные только для setup/phase1:
+  if $FINALIZE; then
+    [[ -n "$SSH_PORT" ]] || die "--finalize requires -p/--ssh-port"
+  else
+    [[ -n "$USER_NAME" ]] || die "Missing -u/--user"
+    [[ -n "$PUB_KEY"  ]] || die "Missing -k/--pubkey"
+    [[ -n "$SSH_PORT" ]] || die "Missing -p/--ssh-port"
+    # XRAY_PORTS может быть пустым (не запрещаем)
+  fi
+
+  trap 'rollback; exit 1' ERR
+
+  if $FINALIZE; then
+    # фаза 2 только
+    step_finalize_two_phase
+    log "Finalize done."
     exit 0
   fi
 
-  # порядок шагов имеет значение
-  step_create_user
-  step_install_key
+  step_update_packages
+  step_create_user_and_key
   step_setup_ufw
-  step_prepare_xray_ports
-  step_change_ssh_port
-  step_harden_ssh
+  step_configure_sshd
+  step_finalize_two_phase
 
-  log "✅ Готово. Шаги записаны в $STATE_FILE"
+  log "Setup complete."
 }
 
-main "$@"
+# ==============================
+# Entry
+# ==============================
+if $UNDO; then
+  do_undo
+else
+  main_setup
+fi
