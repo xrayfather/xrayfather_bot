@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# setup_hardening.sh
-# Хардениг SSH с откатом при ошибках.
+# setup_hardening.sh — безопасная настройка SSH с откатом
 set -Eeuo pipefail
 
 # ========= ЛОГИ =========
@@ -93,13 +92,6 @@ detect_ssh_mgr() {
     fi
   fi
 }
-svc_is_active() {
-  case "$SSH_MGR" in
-    systemd) systemctl is-active --quiet "${SSH_SERVICE:-ssh.service}";;
-    openrc)  rc-service "${SSH_SERVICE:-sshd}" status >/dev/null 2>&1;;
-    sysv)    service "${SSH_SERVICE:-ssh}" status >/dev/null 2>&1;;
-  esac
-}
 svc_enable() {
   case "$SSH_MGR" in
     systemd) [[ -n "$SSH_SERVICE" ]] && systemctl enable "$SSH_SERVICE" || true;;
@@ -114,6 +106,7 @@ svc_disable_socket_if_needed() {
       systemctl stop "$SSH_SOCKET" || true
       systemctl disable "$SSH_SOCKET" || true
       push_rollback "systemctl enable '$SSH_SOCKET' || true; systemctl start '$SSH_SOCKET' || true"
+    end if
     fi
   fi
 }
@@ -149,7 +142,6 @@ SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP="/etc/ssh/sshd_config.bak.${TS}"
 cp -a "$SSHD_CONFIG" "$BACKUP"
 push_rollback "cp -a '$BACKUP' '$SSHD_CONFIG' && (command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true) && true"
-
 log "Сделан бэкап: $BACKUP"
 
 # ========= ПОЛЬЗОВАТЕЛЬ =========
@@ -181,9 +173,22 @@ grep -qxF "$PUBLIC_KEY" "$AUTH_KEYS" || echo "$PUBLIC_KEY" >> "$AUTH_KEYS"
 chown -R "$USERNAME:$USERNAME" "$USER_HOME/.ssh"
 chmod 600 "$AUTH_KEYS"
 
-# ========= FIREWALL: ОТКРЫВАЕМ НОВЫЙ ПОРТ =========
+# ========= FIREWALL: УСТАНОВКА И НАСТРОЙКА =========
 FIREWALL_UNDO_NEW=""
 FIREWALL_UNDO_22=""
+
+# Установим ufw, если отсутствует и есть apt-get
+if ! command -v ufw >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    log "UFW не установлен — устанавливаю…"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null
+    apt-get install -y ufw >/dev/null
+  else
+    log "UFW не установлен и apt-get не найден — пропускаю установку."
+  fi
+fi
+
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "^Status: active"; then
   log "UFW активен — разрешаю ${SSH_PORT}/tcp"
   ufw allow "${SSH_PORT}/tcp" || true
@@ -196,8 +201,24 @@ elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 
   FIREWALL_UNDO_NEW="firewall-cmd --permanent --remove-port='${SSH_PORT}/tcp' || true; firewall-cmd --reload || true"
   push_rollback "$FIREWALL_UNDO_NEW"
 else
-  log "Файрвол не обнаружен или не активен — правила пропущены."
+  if command -v ufw >/dev/null 2>&1; then
+    log "UFW установлен, но не активен — правила пропущены (не включаем автоматически)."
+  else
+    log "Файрвол не обнаружен или не активен — правила пропущены."
+  fi
 fi
+
+# ========= ХЕЛПЕР: РАНТАЙМ-КАТАЛОГ SSHD =========
+ensure_sshd_runtime_dir() {
+  for d in /run/sshd /var/run/sshd; do
+    if [[ ! -d "$d" ]]; then
+      mkdir -p "$d"
+      chown root:root "$d"
+      chmod 0755 "$d"
+      log "Создан runtime‑каталог $d"
+    fi
+  done
+}
 
 # ========= РЕДАКТОР sshd_config =========
 set_sshd_option() {
@@ -217,6 +238,7 @@ set_sshd_option() {
   mv "${SSHD_CONFIG}.tmp" "$SSHD_CONFIG"
 }
 
+# ========= ШАГИ 3–5 (хардeнинг и добавление порта) =========
 log "Харденинг: отключаю пароли и root, включаю pubkey…"
 set_sshd_option "PasswordAuthentication" "no"
 set_sshd_option "ChallengeResponseAuthentication" "no"
@@ -224,7 +246,6 @@ set_sshd_option "UsePAM" "yes"
 set_sshd_option "PubkeyAuthentication" "yes"
 set_sshd_option "PermitRootLogin" "no"
 
-# Добавляем новый порт (не убирая 22 до проверки)
 if ! grep -qE "^[[:space:]]*Port[[:space:]]+${SSH_PORT}\b" "$SSHD_CONFIG"; then
   log "Добавляю Port ${SSH_PORT}…"
   if grep -qE '^[[:space:]]*Match[[:space:]]' "$SSHD_CONFIG"; then
@@ -242,13 +263,14 @@ else
   log "Port ${SSH_PORT} уже есть."
 fi
 
-# ========= ВАЛИДАЦИЯ И РЕСТАРТ =========
+# ========= ВАЛИДАЦИЯ И РЕСТАРТ (шаг 6) =========
 log "Проверяю конфигурацию sshd…"
+ensure_sshd_runtime_dir
 sshd -t -f "$SSHD_CONFIG"
 log "Перезапускаю SSH…"
 svc_restart
 
-# ========= ПРОВЕРКА ВХОДА ПО КЛЮЧУ НА НОВОМ ПОРТУ =========
+# ========= ПРОВЕРКА ВХОДА ПО КЛЮЧУ НА НОВОМ ПОРТУ (шаг 7) =========
 log "Генерирую временный ключ для проверки…"
 TMPKEY="/root/.xrayfather_tmp_sshkey_${TS}"
 ssh-keygen -t ed25519 -N '' -f "$TMPKEY" >/dev/null
@@ -264,11 +286,11 @@ else
   die "Не удалось войти по ключу на новом порту."
 fi
 
-# Удаляем временный ключ из authorized_keys
+# Удаляем временный ключ
 TMP_PUB_LINE="$(cat "${TMPKEY}.pub")"
 sed -i "\#${TMP_PUB_LINE//\//\\/}#d" "$AUTH_KEYS"
 
-# ========= ОТКЛЮЧАЕМ 22 И ФИНАЛЬНЫЙ РЕСТАРТ =========
+# ========= ОТКЛЮЧАЕМ 22 И ФИНАЛЬНЫЙ РЕСТАРТ (шаг 8) =========
 if grep -qE "^[[:space:]]*Port[[:space:]]+22\b" "$SSHD_CONFIG"; then
   log "Комментирую Port 22…"
   sed -E -i "s/^([[:space:]]*)Port[[:space:]]+22\b/\1# Port 22 (disabled ${TS})/" "$SSHD_CONFIG"
@@ -295,6 +317,7 @@ elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 
 fi
 
 log "Повторная проверка sshd…"
+ensure_sshd_runtime_dir
 sshd -t -f "$SSHD_CONFIG"
 log "Финальный рестарт SSH…"
 svc_restart
