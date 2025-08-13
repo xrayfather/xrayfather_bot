@@ -52,22 +52,126 @@ if ss -tln | awk '{print $4}' | grep -Eq ":(^|.*:)${SSH_PORT}\$"; then
   die "Порт ${SSH_PORT} уже занят."
 fi
 
-# ====== Определение unit'ов systemd ======
-SSHD_UNIT=""
-if systemctl list-unit-files | grep -q '^sshd\.service'; then
-  SSHD_UNIT="sshd"
-elif systemctl list-unit-files | grep -q '^ssh\.service'; then
-  SSHD_UNIT="ssh"
-else
-  die "Не найден unit ssh/sshd в systemd."
-fi
+# ====== Определение менеджера сервисов и обертки ======
+SSH_MGR=""        # systemd | sysv | openrc
+SSH_SERVICE=""    # sshd | ssh | snap.openssh.sshd | (для SysV/OpenRC) имя скрипта
+SSH_SOCKET=""
 
-SSH_SOCKET_ACTIVE="no"
-if systemctl list-unit-files | grep -q '^ssh\.socket'; then
-  if systemctl is-enabled ssh.socket >/dev/null 2>&1 || systemctl is-active ssh.socket >/dev/null 2>&1; then
-    SSH_SOCKET_ACTIVE="yes"
+detect_ssh_mgr() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl >/dev/null 2>&1; then
+    SSH_MGR="systemd"
+    # Найдём сервис среди известных имён
+    SSH_SERVICE="$(systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+      | awk '{print $1}' \
+      | grep -E '^(sshd|ssh|snap\.openssh\.sshd)\.service$' -m1 || true)"
+    # socket?
+    SSH_SOCKET="$(systemctl list-unit-files --type=socket --no-legend 2>/dev/null \
+      | awk '{print $1}' \
+      | grep -E '^ssh\.socket$' -m1 || true)"
+
+    # Если нет явного сервиса, но есть сокет — большинство Ubuntu всё равно имеют ssh.service.
+    if [[ -z "$SSH_SERVICE" && -n "$SSH_SOCKET" ]]; then
+      # Попробуем угадать как 'ssh.service' — часто он есть, просто disabled.
+      if systemctl list-unit-files | awk '{print $1}' | grep -qx 'ssh\.service'; then
+        SSH_SERVICE="ssh.service"
+      fi
+    fi
+  else
+    # non-systemd
+    if command -v rc-service >/dev/null 2>&1; then
+      SSH_MGR="openrc"
+      # Обычно сервис называется sshd
+      if rc-service -l | grep -qx 'sshd'; then
+        SSH_SERVICE="sshd"
+      elif rc-service -l | grep -qx 'ssh'; then
+        SSH_SERVICE="ssh"
+      fi
+    elif command -v service >/dev/null 2>&1 || ls /etc/init.d/* >/dev/null 2>&1; then
+      SSH_MGR="sysv"
+      if [[ -x /etc/init.d/sshd ]]; then SSH_SERVICE="sshd"
+      elif [[ -x /etc/init.d/ssh ]]; then SSH_SERVICE="ssh"
+      fi
+    fi
   fi
-fi
+}
+
+svc_is_active() {
+  case "$SSH_MGR" in
+    systemd)
+      systemctl is-active --quiet "${SSH_SERVICE:-ssh.service}"
+      ;;
+    openrc)
+      rc-service "${SSH_SERVICE:-sshd}" status >/dev/null 2>&1
+      ;;
+    sysv)
+      service "${SSH_SERVICE:-ssh}" status >/dev/null 2>&1
+      ;;
+  esac
+}
+
+svc_enable() {
+  case "$SSH_MGR" in
+    systemd)
+      [[ -n "$SSH_SERVICE" ]] && systemctl enable "$SSH_SERVICE" || true
+      ;;
+    openrc)
+      rc-update add "${SSH_SERVICE:-sshd}" default || true
+      ;;
+    sysv)
+      # В SysV оставим как есть
+      true
+      ;;
+  esac
+}
+
+svc_disable_socket_if_needed() {
+  # Для systemd: если активен socket — выключим его, чтобы нормально работать с несколькими Port
+  if [[ "$SSH_MGR" == "systemd" && -n "$SSH_SOCKET" ]]; then
+    if systemctl is-active --quiet "$SSH_SOCKET" || systemctl is-enabled --quiet "$SSH_SOCKET"; then
+      systemctl stop "$SSH_SOCKET" || true
+      systemctl disable "$SSH_SOCKET" || true
+      push_rollback "systemctl enable '$SSH_SOCKET' || true; systemctl start '$SSH_SOCKET' || true"
+    fi
+  fi
+}
+
+svc_restart() {
+  case "$SSH_MGR" in
+    systemd)
+      local unit="${SSH_SERVICE:-ssh.service}"
+      systemctl daemon-reload || true
+      systemctl restart "$unit"
+      ;;
+    openrc)
+      rc-service "${SSH_SERVICE:-sshd}" restart
+      ;;
+    sysv)
+      service "${SSH_SERVICE:-ssh}" restart
+      ;;
+    *)
+      die "Не удалось определить менеджер сервисов SSH."
+      ;;
+  esac
+}
+
+svc_detect_or_die() {
+  detect_ssh_mgr
+  if [[ "$SSH_MGR" == "systemd" ]]; then
+    if [[ -z "$SSH_SERVICE" && -z "$SSH_SOCKET" ]]; then
+      die "Не найден ни ssh/sshd сервис, ни ssh.socket в systemd. Установите openssh-server."
+    fi
+  else
+    if [[ -z "$SSH_SERVICE" ]]; then
+      die "Не найден сервис SSH для ${SSH_MGR}. Установите openssh-server."
+    fi
+  fi
+  log "Обнаружено: менеджер=${SSH_MGR}, сервис=${SSH_SERVICE:-<none>}, socket=${SSH_SOCKET:-<none>}"
+}
+
+# Вызов детектора + при необходимости выключаем socket-активацию
+svc_detect_or_die
+svc_disable_socket_if_needed
+svc_enable || true
 
 # ====== Стек отката ======
 ROLLBACK_CMDS=()
@@ -93,7 +197,7 @@ trap on_error ERR
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP="/etc/ssh/sshd_config.bak.${TS}"
 cp -a "$SSHD_CONFIG" "$BACKUP"
-push_rollback "cp -a '$BACKUP' '$SSHD_CONFIG' && systemctl restart ${SSHD_UNIT}.service || true"
+push_rollback "cp -a '$BACKUP' '$SSHD_CONFIG' && svc_restart || true"
 log "Сделан бэкап: $BACKUP"
 
 # ====== Отключение ssh.socket (если активен) ======
@@ -219,7 +323,7 @@ log "Проверяю конфигурацию sshd…"
 sshd -t -f "$SSHD_CONFIG"
 
 log "Перезапускаю сервис ${SSHD_UNIT}.service…"
-systemctl restart "${SSHD_UNIT}.service"
+svc_restart
 
 # ====== Шаг 7: Проверка входа по ключу на новом порту (локально) ======
 log "Генерирую временную пару ключей для проверки логина…"
@@ -277,7 +381,7 @@ log "Повторная проверка конфига sshd…"
 sshd -t -f "$SSHD_CONFIG"
 
 log "Финальный перезапуск ${SSHD_UNIT}.service…"
-systemctl restart "${SSHD_UNIT}.service"
+svc_restart
 
 # Финальная проверка, что порт слушает
 if ss -tln | awk '{print $4}' | grep -Eq ":(^|.*:)${SSH_PORT}\$"; then
