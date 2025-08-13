@@ -106,7 +106,6 @@ svc_disable_socket_if_needed() {
       systemctl stop "$SSH_SOCKET" || true
       systemctl disable "$SSH_SOCKET" || true
       push_rollback "systemctl enable '$SSH_SOCKET' || true; systemctl start '$SSH_SOCKET' || true"
-    end if
     fi
   fi
 }
